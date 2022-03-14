@@ -1,0 +1,439 @@
+#!/usr/bin/env bash
+#############################################################################################
+# Script to control virsh virtual machines, supports Cloud-Init creation, image creation and
+# general support for creating and deleting VMs through virsh
+#
+# Copyright (C) 2022 Kenan Jasim
+# 
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+#
+# Written by Kenan Jasim <kenan.jasim@outlook.com>, March 2022
+
+#############################################################################################
+# VARIABLES
+#############################################################################################
+CPUS=2
+RAM=2048
+IMAGE=""
+DISK=10
+IMAGE_URL=""
+VERBOSE=""
+KEY_PATH=""
+
+# Colours
+GREEN='\033[0;32m'
+YELLOW='\033[33m'
+RED='\033[0;31m'
+CYAN='\033[0;36m'
+GREY='\033[37m'
+NC='\033[0m'
+PURPLE='\033[0;35m'
+
+# Set the positional arguments list
+POSITIONAL_ARGS=()
+
+# Log File
+LOG_FILE="/tmp/vmctl.log"
+
+export LIBVIRT_DEFAULT_URI=qemu:///system
+
+#############################################################################################
+# Utilities
+#############################################################################################
+
+#######################################
+# Prints a help function
+#######################################
+utils::help(){
+    echo "Control KVM virtual machines"
+    echo 
+    echo "usage: vmctl [options] [flags]"
+    echo "options:"
+    echo "-h         Show this help message"
+    echo
+    echo "commands:"
+    echo "create  create a resource [vm|image]"
+    echo "get     get a resource [vms|images]"
+    echo "delete  delete a resource [vm|image]"
+    echo 
+    echo "examples:"
+    echo "vmctl create vm <name> --cpu 2 --ram 2048 --image ubuntu"
+    echo "vmctl create image <name> --url https://cloud-images.ubuntu.com/focal/current/focal-server-cloudimg-amd64.img"
+    echo "vmctl get vms"
+    echo "vmctl get images"
+    echo "vmctl delete vm <name>"
+    echo "vmctl delete image <name>"
+}
+
+#######################################
+# Prints an info message
+#######################################
+utils::print_info(){
+    message="[INFO] $1"
+    column_length=$(( $(tput cols) -  ${#message} -1 ))
+    printf "${CYAN}$message %${column_length}s\033[0m\n" "[i]"
+}
+
+
+#######################################
+# Prints a success message
+#######################################
+utils::print_success(){
+    message="[SUCCESS] $1"
+    column_length=$(( $(tput cols) -  ${#message} + 1 ))
+    printf "${GREEN}$message %${column_length}s\033[0m\n" "[✓]"
+}
+
+#######################################
+# Prints an error message
+#######################################
+utils::print_error(){
+    message="[ERROR] $1"
+    column_length=$(( $(tput cols) -  ${#message} - 1))
+    printf "${RED}$message %${column_length}s\033[0m\n" "[!]"
+
+    if [[ -n $VERBOSE ]]; then
+      echo -e "${GREY} Log File:"
+      cat $LOG_FILE
+      echo -e "${NC}"
+    fi
+}
+
+#######################################
+# Prints a warning message
+#######################################
+utils::print_warning(){
+    message="[WARN] $1"
+    column_length=$(( $(tput cols) -  ${#message} - 1))
+    printf "${YELLOW}$message %${column_length}s\033[0m\n" "[i]"
+}
+
+
+#######################################
+# Parse Options
+#######################################
+options::parse(){
+  # Parse any options
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+      -c|--cpu)
+        CPUS="$2"
+        shift 
+        shift 
+        ;;
+      -m|--ram)
+        RAM="$2"
+        shift # past argument
+        shift # past value
+        ;;
+      -d|--disk)
+        DISK="$2"
+        shift # past argument
+        shift # past value
+        ;;
+      -i|--image)
+        IMAGE="$2"
+        shift # past argument
+        shift # past value
+        ;;
+      -u|--url)
+        IMAGE_URL="$2"
+        shift # past argument
+        shift # past value
+        ;;
+      -k|--key)
+        IMAGE_URL="$2"
+        shift # past argument
+        shift # past value
+        ;;
+      -h|--help)
+        utils::help # Print help function
+        shift
+        exit 0
+        ;;
+      -v|--verbose)
+        VERBOSE="TRUE"
+        shift
+        ;;
+      -*|--*)
+        utils::print_error "Unknown option $1"
+        utils::help
+        exit 1
+        ;;
+      *)
+        POSITIONAL_ARGS+=("$1") # save positional arg
+        shift # past argument
+        ;;
+    esac
+  done
+  # restore positional parameters
+}
+
+#############################################################################################
+# VM Functions
+#############################################################################################
+
+#######################################
+# Create VM
+# Arguments:
+# 1. Hostname
+#######################################
+create::vm(){
+  # Set Function-wide Variables
+  HOSTNAME=$1
+  VM_PATH=$HOME/kvm/$HOSTNAME
+  
+  # Create VM Path
+  if [[ ! -d $VM_PATH ]]; then
+    mkdir -p $VM_PATH
+  else
+    utils::print_error "VM $HOSTNAME already exists"
+    exit 1
+  fi
+
+  # Create VM Volume
+  if ! qemu-img create -F qcow2 -b /home/kenan/kvm/base/$IMAGE.img -f qcow2 $VM_PATH/$HOSTNAME.qcow2 ${DISK}G 1>>$LOG_FILE 2>&1; then
+    utils::print_error "Failed to create vm image in $VM_PATH"
+    rm -rf $VM_PATH
+    exit 1
+  fi 
+
+  # Create Cloud Init Volume
+  cat >$VM_PATH/user-data <<EOF
+#cloud-config
+hostname: $1
+manage_etc_hosts: true
+users:
+  - name: dev
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    groups: users, admin
+    home: /home/dev
+    shell: /bin/bash
+    lock_passwd: false
+    ssh_authorized_keys:
+      - $(cat $KEY_PATH)
+ssh_pwauth: true
+disable_root: false
+chpasswd:
+  list: |
+    dev:ved
+  expire: false
+EOF
+  #Create Metadata
+  touch $VM_PATH/meta-data
+
+  # Create seed volume
+  if ! cloud-localds -v $VM_PATH/$HOSTNAME-seed.qcow2 $VM_PATH/user-data $VM_PATH/meta-data 1>>$LOG_FILE 2>&1; then
+    utils::print_error "Failed to create cloud init vm in $VM_PATH"
+    rm -rf $VM_PATH
+    exit 1
+  fi 
+
+  # Create VM
+  if ! virt-install --connect qemu:///system --virt-type kvm --name $HOSTNAME --ram $RAM --vcpus=$CPU --os-type linux --disk path=$VM_PATH/$HOSTNAME.qcow2,device=disk --disk path=$VM_PATH/$HOSTNAME-seed.qcow2,device=disk --import  --noautoconsole 1>>$LOG_FILE 2>&1; then
+    utils::print_error "Failed to create vm"
+    rm -rf $VM_PATH
+    exit 1
+  fi
+
+
+}
+
+#######################################
+# Get VMs
+#######################################
+get::vms(){
+  virsh list --all
+}
+
+#######################################
+# Delete VM
+# Arguments:
+# 1. Hostname
+#######################################
+delete::vm(){
+  HOSTNAME=$1
+  VM_PATH=$HOME/kvm/$HOSTNAME
+
+  if [[ ! -d $VM_PATH ]]; then
+    utils::print_error "VM $HOSTNAME doesnt exist"
+    exit 1
+  fi
+
+  # Shutdown VM
+  if ! virsh shutdown $HOSTNAME 1>>$LOG_FILE 2>&1; then
+    utils::print_error "Failed to shutdown vm $HOSTNAME"
+    exit 1
+  fi
+
+  if ! virsh destroy $HOSTNAME 1>>$LOG_FILE 2>&1; then
+    utils::print_error "Failed to destroy vm $HOSTNAME"
+    exit 1
+  fi
+
+  if ! virsh undefine $HOSTNAME 1>>$LOG_FILE 2>&1; then
+    utils::print_error "Failed to undefine vm $HOSTNAME"
+    exit 1
+  fi
+
+  if ! rm -rf $VM_PATH 1>>$LOG_FILE 2>&1; then
+    utils::print_error "Failed to remove vm $HOSTNAME files"
+    exit 1
+  fi
+}
+
+#######################################
+# Create Image
+# Arguments
+# 1. Name
+# 2. URL
+#######################################
+create::image(){
+  # Variables
+  IMAGE_PATH=$HOME/kvm/base
+  IMAGE_NAME=$1
+
+  if [[ ! -d $IMAGE_PATH ]]; then
+    mkdir -p $IMAGE_PATH
+  fi
+
+  # Check if the image exists
+  if [[ -f $IMAGE_PATH/$IMAGE_NAME.img ]]; then
+    utils::print_error "Image with name $IMAGE_NAME already exists"
+    exit 1
+  fi
+
+  # Download Image
+  if ! curl $IMAGE_URL --output $IMAGE_NAME.img 1>>$LOG_FILE 2>&1; then
+    utils::print_error "Failed to download image from $IMAGE_URL"
+    exit 1
+  fi
+
+}
+
+#######################################
+# Get Image
+#######################################
+get::images(){
+  echo "IMAGE"
+  ls $HOME/kvm/base -l | grep ".img" |awk '{print $9}' | sed -e 's/\.img$//'
+}
+
+#######################################
+# Delete Image
+# Arguments
+# 1. Name
+#######################################
+delete::images(){
+  # Variables
+  IMAGE_PATH=$HOME/kvm/base
+  IMAGE_NAME=$1
+
+  if [[ -f $IMAGE_PATH/$IMAGE_NAME.img ]]; then
+    rm -rf $IMAGE_PATH/$IMAGE_NAME.img
+  fi
+}
+
+main(){
+  if [[ -f $LOG_FILE ]]; then
+    rm $LOG_FILE
+  fi
+
+  touch $LOG_FILE
+
+  # Parse out options
+  options::parse $@
+  set -- "${POSITIONAL_ARGS[@]}" 
+
+  # Command Parsing
+  case "$1" in
+    "")
+      utils::print_error "Empty Command"
+      utils::help
+      exit 1
+    ;;
+    create|c)
+      if [[ $# -ne 3 ]]; then
+        utils::print_error "Incorrect ammount of arguments, must pass resource type and name"
+        exit 1
+      fi
+      
+      case "$2" in
+        vms|vm)
+          utils::print_info "Creating VM with name $3"
+          create::vm $3
+          utils::print_success "Created VM"
+        ;;
+        images|image)
+          utils::print_info "Creating image with name $3"
+          create::image $3
+          utils::print_success "Created Image"
+        ;;
+        *)
+          utils::print_error "Unknown resource $2"
+          exit 1
+        ;;
+      esac
+    ;;
+    delete|d)
+      if [[ $# -ne 3 ]]; then
+        utils::print_error "Incorrect ammount of arguments, must pass resource type and name"
+        exit 1
+      fi
+      
+      case "$2" in
+        vms|vm)
+          utils::print_info "Deleting VM with name $3"
+          delete::vm $3
+          utils::print_success "Deleted VM"
+        ;;
+        images|image)
+          utils::print_info "Deleting Image with name $3"
+          create::image $3
+          utils::print_success "Deleted Image"
+        ;;
+        *)
+          utils::print_error "Unknown resource $2"
+          exit 1
+        ;;
+      esac
+    ;;
+    get|g)
+      if [[ $# -ne 2 ]]; then
+        utils::print_error "Incorrect ammount of arguments, must pass resource type"
+        exit 1
+      fi
+      
+      case "$2" in
+        vms|vm)
+          get::vms
+        ;;
+        images|image)
+          get::images
+        ;;
+        *)
+          utils::print_error "Unknown resource $2"
+          exit 1
+        ;;
+      esac
+    ;;
+    *)
+      utils::print_error "Unknown command $1"
+      utils::help
+      exit 1
+    ;;
+  esac
+}
+
+main $@
